@@ -1,5 +1,9 @@
 # REPOPathfinder
 
+[**Get it on Thunderstore**](https://thunderstore.io/c/repo/p/MentalizePez/REPOPathfinder/)
+
+<img src="icon.png" width="120" align="right" alt="REPOPathfinder icon">
+
 A BepInEx plugin for R.E.P.O. that renders an in-world dot trail along the NavMesh path to the current extraction point — or back to the truck once all extractions are complete. It mirrors the same target-selection logic the in-map "backtrack" dots use, projected into world space so you can follow it without opening the map.
 
 **Live release:** [thunderstore.io/c/repo/p/MentalizePez/REPOPathfinder](https://thunderstore.io/c/repo/p/MentalizePez/REPOPathfinder/) — published under the author handle MentalizePez, install via Thunderstore Mod Manager or by dropping the DLL into BepInEx (see [Install](#install)).
