@@ -136,3 +136,9 @@ To run locally: drop the DLL into `<BepInEx profile>/BepInEx/plugins/REPOPathfin
 
 ### 0.1.0
 - Initial implementation: F4 toggle, NavMesh path computation from `PlayerAvatar.LastNavmeshPosition` to `RoundDirector.extractionPointCurrent` (or `LevelGenerator.LevelPathTruck` when all extractions are complete), primitive sphere pool with `Sprites/Default` material at render queue 3500.
+
+## License
+
+Copyright (c) 2026 Isaiah Anson. All rights reserved. You may use the released software for
+personal, non-commercial use; copying, modifying or redistributing it requires written
+permission. See [LICENSE](LICENSE).
