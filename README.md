@@ -140,7 +140,7 @@ To run locally: drop the DLL into `<BepInEx profile>/BepInEx/plugins/REPOPathfin
 REPOPathfinder is built by two developers:
 
 - **Mentalize** ([IsaiahAnson](https://github.com/IsaiahAnson)), co-developer
-- **Pez** ([KaydenceComalander](https://github.com/KaydenceComalander)), co-developer
+- **Pez** ([KaydenceComalander](https://github.com/KaydenceComalander)), co-developer and tester
 
 The Thunderstore release is published under their shared handle, MentalizePez.
 
