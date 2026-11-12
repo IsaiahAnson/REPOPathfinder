@@ -1,0 +1,2 @@
+# The mod is C#. Keep the README card script out of GitHub's language bar.
+tools/make_downloads_card.py -linguist-detectable
