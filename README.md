@@ -133,7 +133,7 @@ To run locally: drop the DLL into `<BepInEx profile>/BepInEx/plugins/REPOPathfin
 - If a game update removes something the plugin reads, the log names it and F4 says the mod needs an update. Repeated errors turn the trail off instead of logging every frame.
 - The config file is written once at startup and when the panel closes. Six trail settings now have ranges.
 
-Every version is in [CHANGELOG.md](CHANGELOG.md).
+Every version is in [CHANGELOG.md](https://github.com/IsaiahAnson/REPOPathfinder/blob/main/CHANGELOG.md).
 
 ## Credits
 
