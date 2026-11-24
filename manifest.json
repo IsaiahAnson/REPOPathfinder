@@ -1,8 +1,8 @@
 {
   "name": "REPOPathfinder",
-  "version_number": "0.7.2",
+  "version_number": "0.7.3",
   "website_url": "https://github.com/IsaiahAnson/REPOPathfinder",
-  "description": "BepInEx plugin for R.E.P.O. Renders an in-world NavMesh dot trail to the current extraction or truck. Cached corners + player projection keep dots stable as you move. F4 toggle, F5 Auto/Truck, F6 IMGUI customize panel (color/size/flow/spacing).",
+  "description": "Draws a dot trail on the floor to the current extraction point, or to the truck when every extraction is done. F4 trail on/off, F5 extraction or truck, F6 panel for color, size, speed and spacing. Client-side.",
   "dependencies": [
     "BepInEx-BepInExPack-5.4.2100"
   ]

@@ -1,10 +1,19 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
+    <!-- The version is written in one place: version_number in manifest.json. -->
+    <ManifestPath>$(MSBuildThisFileDirectory)manifest.json</ManifestPath>
+    <ManifestText>$([System.IO.File]::ReadAllText('$(ManifestPath)'))</ManifestText>
+    <ManifestVersion>$([System.Text.RegularExpressions.Regex]::Match($(ManifestText), '(?&lt;="version_number"\s*:\s*")\d+\.\d+\.\d+').Value)</ManifestVersion>
+    <PluginVersionFile>$(MSBuildThisFileDirectory)obj/PluginVersion.g.cs</PluginVersionFile>
+  </PropertyGroup>
+
+  <PropertyGroup>
     <TargetFramework>netstandard2.1</TargetFramework>
     <AssemblyName>REPOPathfinder</AssemblyName>
     <RootNamespace>REPOPathfinder</RootNamespace>
-    <Version>0.7.2</Version>
+    <Version>$(ManifestVersion)</Version>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <LangVersion>latest</LangVersion>
     <Nullable>disable</Nullable>
     <RestoreAdditionalProjectSources>
@@ -39,16 +48,16 @@
     </Reference>
   </ItemGroup>
 
-  <Target Name="ThunderstorePack" AfterTargets="Build" Condition="'$(Configuration)' == 'Release'">
-    <PropertyGroup>
-      <PackDir>$(MSBuildProjectDirectory)\dist\REPOPathfinder</PackDir>
-    </PropertyGroup>
-    <RemoveDir Directories="$(PackDir)" />
-    <MakeDir Directories="$(PackDir)" />
-    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(PackDir)" />
-    <Copy SourceFiles="manifest.json;README.md;icon.png" DestinationFolder="$(PackDir)" Condition="Exists('icon.png')" />
-    <Copy SourceFiles="manifest.json;README.md" DestinationFolder="$(PackDir)" Condition="!Exists('icon.png')" />
-    <ZipDirectory SourceDirectory="$(PackDir)" DestinationFile="$(MSBuildProjectDirectory)\dist\REPOPathfinder-$(Version).zip" Overwrite="true" />
+  <!-- Writes PluginVersion.Value from manifest.json, so the [BepInPlugin] version matches the package. -->
+  <Target Name="GeneratePluginVersion" BeforeTargets="CoreCompile">
+    <Error Condition="'$(ManifestVersion)' == ''" Text="No version_number (x.y.z) found in $(ManifestPath)." />
+    <WriteLinesToFile File="$(PluginVersionFile)" Overwrite="true" WriteOnlyWhenDifferent="true" Lines="// Generated from manifest.json by REPOPathfinder.csproj. Do not edit.;namespace REPOPathfinder { internal static class PluginVersion { public const string Value = &quot;$(ManifestVersion)&quot;%3B } }" />
+    <ItemGroup>
+      <Compile Remove="$(PluginVersionFile)" />
+      <Compile Include="$(PluginVersionFile)" />
+    </ItemGroup>
   </Target>
+
+  <!-- The Thunderstore zip is built by tools/make_package.py, which leaves the GitHub-only parts out of the README. -->
 
 </Project>

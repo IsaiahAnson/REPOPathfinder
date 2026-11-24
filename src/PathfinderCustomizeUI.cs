@@ -1,3 +1,5 @@
+using System;
+using BepInEx;
 using BepInEx.Configuration;
 using UnityEngine;
 
@@ -5,11 +7,11 @@ namespace REPOPathfinder
 {
     /// <summary>
     /// IMGUI overlay for tweaking dot color and a handful of trail-shape values
-    /// at runtime. Toggled with Plugin.CustomizeMenuKey (default F6). All edits
-    /// write back to the bound BepInEx ConfigEntries, so changes persist across
-    /// sessions and the world dots update live (PathfinderManager subscribes to
-    /// DotColorHex.SettingChanged for color, and reads scale/flow/spacing every
-    /// frame so they pick up automatically).
+    /// at runtime. Toggled with Plugin.CustomizeMenuKey (default F6); Esc also closes
+    /// it. Edits go to the bound BepInEx ConfigEntries, so the world dots update live
+    /// (PathfinderManager subscribes to DotColorHex.SettingChanged for color, and reads
+    /// scale/flow/spacing every frame). The config file is written once, when the
+    /// panel closes, not on every slider step.
     /// </summary>
     public class PathfinderCustomizeUI : MonoBehaviour
     {
@@ -40,7 +42,6 @@ namespace REPOPathfinder
         private Texture2D _whiteTex;
         private GUIStyle _boldStyle;
 
-        private CursorLockMode _savedLockState;
         private bool _savedCursorVisible;
         private bool _cursorOverridden;
 
@@ -51,35 +52,55 @@ namespace REPOPathfinder
 
         private void Update()
         {
-            if (Input.GetKeyDown(Plugin.Instance.CustomizeMenuKey.Value))
+            var input = UnityInput.Current;
+            if (input.GetKeyDown(Plugin.Instance.CustomizeMenuKey.Value))
             {
-                _visible = !_visible;
-                if (_visible)
-                {
-                    _needsSyncFromConfig = true;
-                    AcquireCursor();
-                }
-                else
-                {
-                    ReleaseCursor();
-                }
-                // Block the player controller's mouse-look / movement / fire while
-                // the menu is open. IMGUI clicks come through Event.current and
-                // hotkeys (GetKey*) are deliberately not patched, so closing the
-                // menu still works.
-                InputBlocker.BlockInput = _visible;
+                if (_visible) Close(); else Open();
             }
+            else if (_visible && input.GetKeyDown(KeyCode.Escape))
+            {
+                Close();
+            }
+
+            // While the panel is open the game must not move, look around, grab or open
+            // its own menus in response to the same mouse and keyboard input.
+            if (_visible) GameInput.HoldThisFrame();
         }
 
         private void OnDisable()
         {
-            // If the component is disabled (scene unload, mod unload, etc) while
-            // the menu is up, don't leave the player frozen.
-            if (_visible)
+            // Never leave the player frozen or the settings unsaved.
+            if (_visible) Close();
+        }
+
+        private void Open()
+        {
+            _visible = true;
+            _needsSyncFromConfig = true;
+            _savedCursorVisible = Cursor.visible;
+            _cursorOverridden = true;
+            // Sliders change a setting many times a second; the file is written on Close.
+            Plugin.Instance.Config.SaveOnConfigSet = false;
+        }
+
+        private void Close()
+        {
+            _visible = false;
+            if (_cursorOverridden)
             {
-                _visible = false;
-                ReleaseCursor();
-                InputBlocker.BlockInput = false;
+                // The game locks the cursor again by itself once GameInput stops holding it.
+                Cursor.visible = _savedCursorVisible;
+                _cursorOverridden = false;
+            }
+
+            Plugin.Instance.Config.SaveOnConfigSet = true;
+            try
+            {
+                Plugin.Instance.Config.Save();
+            }
+            catch (Exception e)
+            {
+                Plugin.Log.LogWarning("Could not save the config file: " + e.Message);
             }
         }
 
@@ -93,9 +114,8 @@ namespace REPOPathfinder
                 _needsSyncFromConfig = false;
             }
 
-            // REPO normally locks/hides the cursor during gameplay. We override
-            // this every frame the menu is open so sliders are clickable; on
-            // close we restore whatever state the game was using.
+            // REPO locks and hides the cursor during gameplay. Keep it free and visible
+            // every frame the panel is open so the sliders are clickable.
             if (Cursor.lockState != CursorLockMode.None) Cursor.lockState = CursorLockMode.None;
             if (!Cursor.visible) Cursor.visible = true;
 
@@ -105,22 +125,6 @@ namespace REPOPathfinder
                 DrawWindow,
                 "REPOPathfinder — Customize",
                 GUILayout.Width(360f));
-        }
-
-        private void AcquireCursor()
-        {
-            if (_cursorOverridden) return;
-            _savedLockState = Cursor.lockState;
-            _savedCursorVisible = Cursor.visible;
-            _cursorOverridden = true;
-        }
-
-        private void ReleaseCursor()
-        {
-            if (!_cursorOverridden) return;
-            Cursor.lockState = _savedLockState;
-            Cursor.visible = _savedCursorVisible;
-            _cursorOverridden = false;
         }
 
         private void SyncFromConfig()
@@ -193,9 +197,7 @@ namespace REPOPathfinder
             GUILayout.FlexibleSpace();
             if (GUILayout.Button("Close", GUILayout.Width(60f)))
             {
-                _visible = false;
-                ReleaseCursor();
-                InputBlocker.BlockInput = false;
+                Close();
             }
             GUILayout.EndHorizontal();
 

@@ -1,9 +1,7 @@
 using System;
-using System.Reflection;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
-using HarmonyLib;
 using UnityEngine;
 
 namespace REPOPathfinder
@@ -24,7 +22,8 @@ namespace REPOPathfinder
     {
         public const string GUID = "isaia.repopathfinder";
         public const string NAME = "REPOPathfinder";
-        public const string VERSION = "0.7.2";
+        // Written by the build from version_number in manifest.json (see REPOPathfinder.csproj).
+        public const string VERSION = PluginVersion.Value;
 
         // Bumped whenever a default value changes. The migration step below
         // overwrites stale values that match a previous default with the new
@@ -59,6 +58,9 @@ namespace REPOPathfinder
             Instance = this;
             Log = Logger;
 
+            // Bind everything first and write the file once at the end of Awake.
+            Config.SaveOnConfigSet = false;
+
             ToggleKey = Config.Bind(
                 "Input", "ToggleKey", KeyCode.F4,
                 "Key that toggles the on-the-ground guidance trail.");
@@ -77,16 +79,19 @@ namespace REPOPathfinder
 
             Spacing = Config.Bind(
                 "Trail", "SpacingMeters", 1.5f,
-                "Distance between dots in meters along the path.");
+                new ConfigDescription("Distance between dots in meters along the path.",
+                    new AcceptableValueRange<float>(0.5f, 4f)));
             MaxDots = Config.Bind(
                 "Trail", "MaxDots", 30,
-                "Maximum number of dots placed at once. Higher values reach further but cost more.");
+                new ConfigDescription("Maximum number of dots placed at once. Higher values reach further but cost more.",
+                    new AcceptableValueRange<int>(1, 100)));
             GroundOffset = Config.Bind(
                 "Trail", "GroundOffsetMeters", 0.1f,
                 "Small vertical offset above the NavMesh surface so dots don't z-fight with the floor.");
             DotScale = Config.Bind(
                 "Trail", "DotScale", 0.07f,
-                "Diameter of each dot in meters.");
+                new ConfigDescription("Diameter of each dot in meters.",
+                    new AcceptableValueRange<float>(0.02f, 0.5f)));
             DotColorHex = Config.Bind(
                 "Trail", "DotColorHex", "#FFFFFF55",
                 "Dot color as #RRGGBBAA. Default is faint translucent white (~33% alpha).");
@@ -98,13 +103,16 @@ namespace REPOPathfinder
                 "If the player is within this distance of the target, dots are hidden.");
             FlowSpeed = Config.Bind(
                 "Trail", "FlowSpeedMetersPerSec", 2.0f,
-                "How fast dots flow forward along the path, in meters per second. The trail recycles continuously so the path is always populated from the player.");
+                new ConfigDescription("How fast dots flow forward along the path, in meters per second. The trail recycles continuously so the path is always populated from the player.",
+                    new AcceptableValueRange<float>(0f, 6f)));
             FadeZoneFraction = Config.Bind(
                 "Trail", "FadeZoneFraction", 0.4f,
-                "Fraction of one spacing over which dots fade in (near the player end of the recycle) and fade out (near the front). Smaller = sharper edges; larger = softer flow. Range 0.05-0.5.");
+                new ConfigDescription("Fraction of one spacing over which dots fade in (near the player end of the recycle) and fade out (near the front). Smaller = sharper edges; larger = softer flow.",
+                    new AcceptableValueRange<float>(0.05f, 0.5f)));
             PositionSmoothRate = Config.Bind(
                 "Trail", "PositionSmoothRate", 25f,
-                "Damping rate for dot world positions (1/seconds). With the cached-path model the trail no longer translates with player movement, but smoothing still helps soften the rare jumps when the path is re-oriented after a turn. Higher = snappier. Lower = softer. Set to 0 to disable.");
+                new ConfigDescription("Damping rate for dot world positions (1/seconds). The trail does not move with the player, but smoothing softens the jump when the path is re-oriented after a turn. Higher = snappier. Lower = softer. Set to 0 to disable.",
+                    new AcceptableValueRange<float>(0f, 60f)));
             OffPathThreshold = Config.Bind(
                 "Trail", "OffPathRecomputeThresholdMeters", 3.0f,
                 "When the player drifts further than this many meters from the cached path's polyline, the path is recomputed. Lower values make the trail re-orient faster after a turn but can cause spurious recomputes when hugging walls in wide rooms; higher values are steadier but lag longer after a deliberate turn into a different corridor.");
@@ -119,24 +127,25 @@ namespace REPOPathfinder
                 ConfigVersion.Value = CurrentConfigVersion;
             }
 
+            Config.SaveOnConfigSet = true;
+            try
+            {
+                Config.Save();
+            }
+            catch (Exception e)
+            {
+                Log.LogWarning("Could not write the config file: " + e.Message);
+            }
+
+            GameAccess.Bind(Log);
+
             var managerObj = new GameObject("REPOPathfinderManager");
             UnityEngine.Object.DontDestroyOnLoad(managerObj);
             managerObj.hideFlags = HideFlags.HideAndDontSave;
             managerObj.AddComponent<PathfinderManager>();
             managerObj.AddComponent<PathfinderCustomizeUI>();
 
-            // Harmony patches: InputBlocker zeros out legacy Input.* axes/buttons
-            // and the new InputAction.ReadValue<T>() while the customize menu is
-            // open, so dragging sliders no longer rotates the camera or fires
-            // weapons. PatchAll picks up the legacy attribute-decorated patches;
-            // the InputSystem patches are bound dynamically because we don't
-            // reference Unity.InputSystem at compile time.
-            var harmony = new Harmony(GUID);
-            try { harmony.PatchAll(Assembly.GetExecutingAssembly()); }
-            catch (Exception e) { Log.LogWarning($"Harmony PatchAll issues (non-fatal): {e.Message}"); }
-            InputBlocker.PatchInputSystem(harmony);
-
-            Log.LogInfo($"{NAME} {VERSION} loaded. Toggle key: {ToggleKey.Value}");
+            Log.LogInfo($"{NAME} {VERSION} loaded. Trail: {ToggleKey.Value}, target: {TargetToggleKey.Value}, customize: {CustomizeMenuKey.Value}.");
         }
 
         private void MigrateConfig(int fromVersion)

@@ -1,6 +1,6 @@
 using System;
 using System.Collections.Generic;
-using System.Reflection;
+using BepInEx;
 using UnityEngine;
 using UnityEngine.AI;
 using UnityEngine.Rendering;
@@ -9,55 +9,66 @@ using UnityEngine.SceneManagement;
 namespace REPOPathfinder
 {
     /// <summary>
-    /// Mirrors REPO's MapBacktrack target logic into world-space dots so the
-    /// player can follow guidance without opening the map.
+    /// Draws the game's "where to go next" guidance as dots on the floor, so the player can follow
+    /// it without opening the map. The target is chosen the way the map's backtrack dots choose it:
+    /// the active extraction point, or the truck once every extraction is done.
     ///
-    /// Path model (v0.5): the NavMesh path is computed *once* (per route) and
-    /// cached as a fixed list of world-space corners with prefix arc-distances.
-    /// Each frame the player's current position is projected onto that cached
-    /// polyline to produce a `_playerArc` scalar; dots are placed at world
-    /// positions corresponding to (playerArc + slot*spacing + animOffset) along
-    /// the cached corners. Recompute is on-demand only:
-    ///   - target identity changed (extraction completed / new active extraction
-    ///     / truck activated)
-    ///   - player drifted more than OffPathThreshold meters from the polyline
-    ///     (i.e., took a different route)
-    /// This decouples dot world positions from per-frame player movement, so
-    /// walking forward or backward along the path does not jitter the trail.
+    /// Path model: the NavMesh path is computed once per route and cached as world-space corners
+    /// with prefix arc-distances. Each frame the player's position is projected onto that polyline
+    /// to get a `playerArc`; dots sit at (playerArc + slot*spacing + animOffset) along the cached
+    /// corners. A new path is computed only when the target changes or the player drifts more than
+    /// OffPathThreshold meters from the polyline, so walking along the path never moves the dots.
     ///
-    /// Animation model (unchanged from v0.3): a single shared `_animOffset` in
-    /// [0, spacing) plus a circular pool pointer `_frontPool` keeps spacing
-    /// perfectly even and makes the per-cycle wrap (one sphere going front -> hidden
-    /// -> back) invisible behind alpha fade.
+    /// Animation model: one shared `_animOffset` in [0, spacing) plus a circular pool pointer
+    /// `_frontPool` keeps spacing even and hides the per-cycle wrap behind the alpha fade.
     /// </summary>
     public class PathfinderManager : MonoBehaviour
     {
+        // A path query that failed is not repeated before this much time has passed.
+        private const float RetryAfterFailedPathSeconds = 0.75f;
+        private const float MinSecondsBetweenPaths = 0.2f;
+        // How far the target and a spectated player may be from the NavMesh and still be used.
+        private const float TargetSnapMeters = 4f;
+        private const float SpectatedSnapMeters = 3f;
+        // The player's last NavMesh position is ignored when it is further than this from the player.
+        private const float StaleStartMeters = 10f;
+        private const int FailuresBeforeTurningOff = 5;
+
+        private static readonly string[] ShaderNames =
+        {
+            "Sprites/Default", "Unlit/Color", "Hidden/Internal-Colored", "Standard",
+        };
+
         private bool _trailEnabled;
         private NavMeshPath _path;
+        private Vector3[] _cornerBuffer = new Vector3[128];
 
-        // Cached path: corners and prefix arc distances. _totalLength = arc of last corner.
-        private Vector3[] _cachedCorners;
-        private float[] _cachedArcs;
+        // Cached path: the first _cornerCount entries are corners and prefix arc distances.
+        private Vector3[] _cachedCorners = new Vector3[128];
+        private float[] _cachedArcs = new float[128];
+        private int _cornerCount;
         private float _totalLength;
-        private object _cachedTargetIdentity;
+        private Transform _cachedTarget;
+        private Transform _reportedTarget;
+        private float _nextPathAttempt;
 
         private readonly List<GameObject> _dots = new List<GameObject>();
         private readonly List<MeshRenderer> _renderers = new List<MeshRenderer>();
-        private Vector3[] _smoothedPositions;
-        private bool[] _wasVisible;
+        private Vector3[] _smoothedPositions = new Vector3[0];
+        private bool[] _wasVisible = new bool[0];
+        private bool _anyDotVisible;
 
         private float _animOffset;
         private int _frontPool;
-        private bool _animInitialized;
 
         private Material _sharedMaterial;
+        private bool _materialCreated;
         private MaterialPropertyBlock _mpb;
         private Color _baseColor;
         private static readonly int ColorPropId = Shader.PropertyToID("_Color");
 
-        private FieldInfo _fldExtractionPointCurrent;
-        private FieldInfo _fldAllExtractionPointsCompleted;
-        private FieldInfo _fldLastNavmeshPosition;
+        private int _failures;
+        private bool _failureLogged;
 
         private float _toastUntil;
         private string _toastText;
@@ -67,32 +78,19 @@ namespace REPOPathfinder
         {
             _path = new NavMeshPath();
             _mpb = new MaterialPropertyBlock();
-            _trailEnabled = Plugin.Instance.EnabledOnStart.Value;
+            _trailEnabled = Plugin.Instance.EnabledOnStart.Value && GameAccess.Ready;
             _baseColor = ParseColor(Plugin.Instance.DotColorHex.Value);
 
-            _fldExtractionPointCurrent = Reflect.Field(typeof(RoundDirector), "extractionPointCurrent");
-            _fldAllExtractionPointsCompleted = Reflect.Field(typeof(RoundDirector), "allExtractionPointsCompleted");
-            _fldLastNavmeshPosition = Reflect.Field(typeof(PlayerAvatar), "LastNavmeshPosition");
-
-            if (_fldExtractionPointCurrent == null || _fldAllExtractionPointsCompleted == null || _fldLastNavmeshPosition == null)
-            {
-                Plugin.Log.LogWarning("Could not bind one or more REPO internal fields via reflection. Trail may be inactive.");
-            }
-
-            // Live-update the cached color whenever the customization UI (or any
-            // other config consumer) writes a new value. ApplyDotAlpha reads
-            // _baseColor every frame, so dots in the world refresh instantly.
+            // ApplyDotAlpha reads _baseColor every frame, so the dots follow the customize panel live.
             Plugin.Instance.DotColorHex.SettingChanged += OnDotColorChanged;
         }
 
         private void OnDestroy()
         {
-            try
+            if (Plugin.Instance != null && Plugin.Instance.DotColorHex != null)
             {
-                if (Plugin.Instance != null && Plugin.Instance.DotColorHex != null)
-                    Plugin.Instance.DotColorHex.SettingChanged -= OnDotColorChanged;
+                Plugin.Instance.DotColorHex.SettingChanged -= OnDotColorChanged;
             }
-            catch { /* shutdown — safe to ignore */ }
         }
 
         private void OnDotColorChanged(object sender, EventArgs e)
@@ -112,76 +110,114 @@ namespace REPOPathfinder
 
         private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
         {
-            // Cached corners are world-space references; they don't survive a
-            // scene change. Drop them so the next frame triggers a fresh compute.
-            InvalidateCache();
-            HideAllDots();
-        }
-
-        private void InvalidateCache()
-        {
-            _cachedCorners = null;
-            _cachedArcs = null;
-            _totalLength = 0f;
-            _cachedTargetIdentity = null;
-            if (_wasVisible != null) System.Array.Clear(_wasVisible, 0, _wasVisible.Length);
+            DropTrail();
         }
 
         private void Update()
         {
-            if (Input.GetKeyDown(Plugin.Instance.ToggleKey.Value))
+            HandleHotkeys();
+            if (!_trailEnabled) return;
+
+            try
             {
-                _trailEnabled = !_trailEnabled;
-                ShowToast(_trailEnabled ? "Pathfinder: ON" : "Pathfinder: OFF");
-                if (!_trailEnabled) HideAllDots();
+                UpdateTrail();
+                _failures = 0;
+            }
+            catch (Exception e)
+            {
+                // One broken frame must not become an error every frame for the rest of the session.
+                DropTrail();
+                if (!_failureLogged)
+                {
+                    _failureLogged = true;
+                    Plugin.Log.LogError("The trail could not be updated: " + e);
+                }
+                if (++_failures >= FailuresBeforeTurningOff)
+                {
+                    _failures = 0;
+                    _trailEnabled = false;
+                    Plugin.Log.LogError($"The trail was turned off after {FailuresBeforeTurningOff} failed updates in a row. " +
+                                        $"Press {Plugin.Instance.ToggleKey.Value} to turn it on again.");
+                    ShowToast("Pathfinder: error, turned off");
+                }
+            }
+        }
+
+        private void HandleHotkeys()
+        {
+            var input = UnityInput.Current;
+
+            if (input.GetKeyDown(Plugin.Instance.ToggleKey.Value))
+            {
+                if (!GameAccess.Ready)
+                {
+                    ShowToast("Pathfinder: needs an update for this game version");
+                }
+                else
+                {
+                    _trailEnabled = !_trailEnabled;
+                    _failures = 0;
+                    _failureLogged = false;
+                    ShowToast(_trailEnabled ? "Pathfinder: ON" : "Pathfinder: OFF");
+                    if (!_trailEnabled) DropTrail();
+                }
             }
 
-            if (Input.GetKeyDown(Plugin.Instance.TargetToggleKey.Value))
+            if (input.GetKeyDown(Plugin.Instance.TargetToggleKey.Value))
             {
-                var current = Plugin.Instance.TargetMode.Value;
-                var next = current == PathfinderTargetMode.Auto
+                var next = Plugin.Instance.TargetMode.Value == PathfinderTargetMode.Auto
                     ? PathfinderTargetMode.Truck
                     : PathfinderTargetMode.Auto;
                 Plugin.Instance.TargetMode.Value = next;
-                ShowToast(next == PathfinderTargetMode.Truck
-                    ? "Target: Truck"
-                    : "Target: Auto");
-                // The cached path was computed for the previous target; drop it
-                // so the next frame produces a fresh path to the new destination.
+                ShowToast(next == PathfinderTargetMode.Truck ? "Target: Truck" : "Target: Auto");
+                // The cached path leads to the previous target.
                 InvalidateCache();
             }
+        }
 
-            if (!_trailEnabled) return;
-
+        private void UpdateTrail()
+        {
             if (Map.Instance == null || PlayerController.instance == null ||
                 LevelGenerator.Instance == null || !LevelGenerator.Instance.Generated ||
                 RoundDirector.instance == null)
             {
-                HideAllDots();
+                // Between levels: the cached corners belong to a level that is gone.
+                DropTrail();
                 return;
             }
 
-            var avatar = PlayerController.instance.playerAvatarScript;
-            if (avatar == null) { HideAllDots(); return; }
-
-            Vector3 playerPos = Reflect.GetFieldValue(_fldLastNavmeshPosition, avatar, avatar.transform.position);
-
-            if (NeedRecompute(playerPos))
+            Transform target = ResolveTarget();
+            if (target == null)
             {
-                if (!RecomputePath(playerPos))
-                {
-                    HideAllDots();
-                    return;
-                }
+                DropTrail();
+                return;
             }
 
-            if (_cachedCorners == null || _cachedCorners.Length < 2 || _totalLength <= 0.5f)
+            if (!TryGetStart(out Vector3 start))
             {
                 HideAllDots();
                 return;
             }
 
-            ProjectOnCachedPath(playerPos, out float playerArc, out _);
+            float playerArc = 0f;
+            bool onPath = _cornerCount >= 2 && target == _cachedTarget &&
+                          ProjectOnCachedPath(start, out playerArc, out float offPath) &&
+                          offPath <= Plugin.Instance.OffPathThreshold.Value;
+
+            if (!onPath && Time.unscaledTime >= _nextPathAttempt)
+            {
+                bool computed = RecomputePath(start, target);
+                _nextPathAttempt = Time.unscaledTime + (computed ? MinSecondsBetweenPaths : RetryAfterFailedPathSeconds);
+                if (computed) ProjectOnCachedPath(start, out playerArc, out _);
+            }
+
+            // No usable path to this target (yet). An older path to the same target stays on screen
+            // while a new one is waited for.
+            if (_cornerCount < 2 || target != _cachedTarget || _totalLength <= 0.5f)
+            {
+                HideAllDots();
+                return;
+            }
 
             float availableLength = _totalLength - playerArc;
             if (availableLength < Plugin.Instance.MinDistanceToTarget.Value)
@@ -193,136 +229,156 @@ namespace REPOPathfinder
             AdvanceAndPlace(Time.deltaTime, playerArc, availableLength);
         }
 
-        private object ResolveTargetIdentity()
+        // Truck mode: always the truck. Auto mode: what the map's backtrack dots point at.
+        private static Transform ResolveTarget()
         {
-            // Truck mode overrides the game state: always head back to the truck,
-            // even if extractions are still pending (used to charge items mid-run).
-            if (Plugin.Instance.TargetMode.Value == PathfinderTargetMode.Truck)
-            {
-                return LevelGenerator.Instance != null && LevelGenerator.Instance.LevelPathTruck != null
-                    ? (object)"truck"
-                    : null;
-            }
+            LevelPoint truck = LevelGenerator.Instance.LevelPathTruck;
+            Transform truckTransform = truck != null ? truck.transform : null;
 
-            // Auto mode: mirrors REPO's own MapBacktrack target selection.
-            bool allDone = Reflect.GetFieldValue(_fldAllExtractionPointsCompleted, RoundDirector.instance, false);
-            if (allDone) return "truck";
-            return Reflect.GetFieldValue<ExtractionPoint>(_fldExtractionPointCurrent, RoundDirector.instance, null);
+            if (Plugin.Instance.TargetMode.Value == PathfinderTargetMode.Truck) return truckTransform;
+
+            RoundDirector director = RoundDirector.instance;
+            if (GameAccess.AllExtractionsDone(director)) return truckTransform;
+
+            ExtractionPoint point = GameAccess.CurrentExtraction(director);
+            return point != null ? point.transform : null;
         }
 
-        private bool NeedRecompute(Vector3 playerPos)
+        // Where the trail starts: the local player, or the teammate being spectated while dead.
+        private static bool TryGetStart(out Vector3 start)
         {
-            var current = ResolveTargetIdentity();
-            if (current == null)
+            start = default;
+            PlayerAvatar avatar = PlayerController.instance.playerAvatarScript;
+            if (avatar == null) return false;
+
+            if (!GameAccess.IsDead(avatar))
             {
-                // No active target - drop the cache so we don't render against stale corners.
-                if (_cachedCorners != null) InvalidateCache();
-                return false;
+                start = GameAccess.LastNavmeshPosition(avatar);
+                Vector3 actual = avatar.transform.position;
+                if ((start - actual).sqrMagnitude <= StaleStartMeters * StaleStartMeters) return true;
+                // Not set yet on this level, or left behind by a teleport.
+                return SnapToNavMesh(actual, SpectatedSnapMeters, out start);
             }
 
-            if (_cachedCorners == null || _cachedCorners.Length < 2) return true;
-            if (!Equals(current, _cachedTargetIdentity)) return true;
+            PlayerAvatar spectated = GameAccess.SpectatedPlayer();
+            if (spectated == null || spectated == avatar) return false;
+            return SnapToNavMesh(spectated.transform.position, SpectatedSnapMeters, out start);
+        }
 
-            if (!ProjectOnCachedPath(playerPos, out _, out var dist)) return true;
-            if (dist > Plugin.Instance.OffPathThreshold.Value) return true;
-
+        private static bool SnapToNavMesh(Vector3 position, float maxDistance, out Vector3 snapped)
+        {
+            if (NavMesh.SamplePosition(position, out NavMeshHit hit, maxDistance, NavMesh.AllAreas))
+            {
+                snapped = hit.position;
+                return true;
+            }
+            snapped = position;
             return false;
         }
 
-        private bool RecomputePath(Vector3 playerPos)
+        private bool RecomputePath(Vector3 start, Transform target)
         {
-            var target = ResolveTargetIdentity();
-            if (target == null) return false;
+            SnapToNavMesh(target.position, TargetSnapMeters, out Vector3 goal);
 
-            Vector3 targetPos;
-            if (target as string == "truck")
-            {
-                var truck = LevelGenerator.Instance.LevelPathTruck;
-                if (truck == null) return false;
-                targetPos = truck.transform.position;
-            }
-            else if (target is ExtractionPoint ep)
-            {
-                targetPos = ep.transform.position;
-            }
-            else
+            if (!NavMesh.CalculatePath(start, goal, NavMesh.AllAreas, _path) ||
+                _path.status == NavMeshPathStatus.PathInvalid)
             {
                 return false;
             }
 
-            if (Vector3.Distance(playerPos, targetPos) < Plugin.Instance.MinDistanceToTarget.Value)
-                return false;
-
-            if (!NavMesh.CalculatePath(playerPos, targetPos, NavMesh.AllAreas, _path) ||
-                _path.status == NavMeshPathStatus.PathInvalid ||
-                _path.corners == null || _path.corners.Length < 2)
+            int count = _path.GetCornersNonAlloc(_cornerBuffer);
+            while (count == _cornerBuffer.Length && _cornerBuffer.Length < 4096)
             {
-                return false;
+                _cornerBuffer = new Vector3[_cornerBuffer.Length * 2];
+                count = _path.GetCornersNonAlloc(_cornerBuffer);
             }
+            if (count < 2) return false;
 
-            CacheCurrentPath();
-            _cachedTargetIdentity = target;
-            return true;
-        }
+            CachePath(count);
+            _cachedTarget = target;
 
-        private void CacheCurrentPath()
-        {
-            var c = _path.corners;
-            if (_cachedCorners == null || _cachedCorners.Length != c.Length)
+            if (target != _reportedTarget)
             {
-                _cachedCorners = new Vector3[c.Length];
-                _cachedArcs = new float[c.Length];
-            }
-            _cachedCorners[0] = c[0];
-            _cachedArcs[0] = 0f;
-            for (int i = 1; i < c.Length; i++)
-            {
-                _cachedCorners[i] = c[i];
-                _cachedArcs[i] = _cachedArcs[i - 1] + Vector3.Distance(c[i - 1], c[i]);
-            }
-            _totalLength = _cachedArcs[c.Length - 1];
-
-            // Reset smoothing flags so dots snap to their new positions on the
-            // next frame instead of drawing a curved interpolation across the
-            // path re-orientation.
-            if (_wasVisible != null) System.Array.Clear(_wasVisible, 0, _wasVisible.Length);
-        }
-
-        // Projects p onto the cached polyline. Returns the arc-distance of the
-        // closest point and that point's distance from p.
-        private bool ProjectOnCachedPath(Vector3 p, out float arc, out float dist)
-        {
-            arc = 0f;
-            dist = float.MaxValue;
-            if (_cachedCorners == null || _cachedCorners.Length < 2) return false;
-
-            for (int i = 1; i < _cachedCorners.Length; i++)
-            {
-                Vector3 a = _cachedCorners[i - 1];
-                Vector3 b = _cachedCorners[i];
-                Vector3 ab = b - a;
-                float sqrLen = ab.sqrMagnitude;
-                if (sqrLen < 1e-6f) continue;
-
-                float t = Vector3.Dot(p - a, ab) / sqrLen;
-                t = Mathf.Clamp01(t);
-                Vector3 cp = a + ab * t;
-                float d = Vector3.Distance(cp, p);
-                if (d < dist)
+                _reportedTarget = target;
+                Plugin.Log.LogInfo($"Path to {target.name}: {_path.status}, {count} corners, {_totalLength:F0} m.");
+                if (_path.status == NavMeshPathStatus.PathPartial)
                 {
-                    dist = d;
-                    arc = _cachedArcs[i - 1] + Mathf.Sqrt(sqrLen) * t;
+                    ShowToast("Pathfinder: no full route, showing the closest one");
                 }
             }
             return true;
         }
 
+        private void CachePath(int count)
+        {
+            if (_cachedCorners.Length < count)
+            {
+                _cachedCorners = new Vector3[_cornerBuffer.Length];
+                _cachedArcs = new float[_cornerBuffer.Length];
+            }
+
+            _cachedCorners[0] = _cornerBuffer[0];
+            _cachedArcs[0] = 0f;
+            for (int i = 1; i < count; i++)
+            {
+                _cachedCorners[i] = _cornerBuffer[i];
+                _cachedArcs[i] = _cachedArcs[i - 1] + Vector3.Distance(_cornerBuffer[i - 1], _cornerBuffer[i]);
+            }
+            _cornerCount = count;
+            _totalLength = _cachedArcs[count - 1];
+
+            // Dots snap to the new path instead of sliding across the room to it.
+            Array.Clear(_wasVisible, 0, _wasVisible.Length);
+        }
+
+        private void InvalidateCache()
+        {
+            _cornerCount = 0;
+            _totalLength = 0f;
+            _cachedTarget = null;
+            _nextPathAttempt = 0f;
+        }
+
+        private void DropTrail()
+        {
+            InvalidateCache();
+            HideAllDots();
+        }
+
+        // Projects p onto the cached polyline. Returns the arc-distance of the closest point and
+        // that point's distance from p.
+        private bool ProjectOnCachedPath(Vector3 p, out float arc, out float dist)
+        {
+            arc = 0f;
+            dist = float.MaxValue;
+            if (_cornerCount < 2) return false;
+
+            float bestSqr = float.MaxValue;
+            for (int i = 1; i < _cornerCount; i++)
+            {
+                Vector3 a = _cachedCorners[i - 1];
+                Vector3 ab = _cachedCorners[i] - a;
+                float sqrLen = ab.sqrMagnitude;
+                if (sqrLen < 1e-6f) continue;
+
+                float t = Mathf.Clamp01(Vector3.Dot(p - a, ab) / sqrLen);
+                float sqr = (a + ab * t - p).sqrMagnitude;
+                if (sqr < bestSqr)
+                {
+                    bestSqr = sqr;
+                    arc = _cachedArcs[i - 1] + Mathf.Sqrt(sqrLen) * t;
+                }
+            }
+            if (bestSqr == float.MaxValue) return false;
+            dist = Mathf.Sqrt(bestSqr);
+            return true;
+        }
+
         private Vector3 CachedPointAtDistance(float distance)
         {
-            if (_cachedCorners == null || _cachedCorners.Length == 0) return Vector3.zero;
-            if (_cachedCorners.Length == 1 || distance <= 0f) return _cachedCorners[0];
+            if (distance <= 0f) return _cachedCorners[0];
 
-            for (int i = 1; i < _cachedCorners.Length; i++)
+            for (int i = 1; i < _cornerCount; i++)
             {
                 if (distance <= _cachedArcs[i])
                 {
@@ -332,7 +388,7 @@ namespace REPOPathfinder
                     return Vector3.Lerp(_cachedCorners[i - 1], _cachedCorners[i], t);
                 }
             }
-            return _cachedCorners[_cachedCorners.Length - 1];
+            return _cachedCorners[_cornerCount - 1];
         }
 
         private void AdvanceAndPlace(float dt, float playerArc, float availableLength)
@@ -345,14 +401,6 @@ namespace REPOPathfinder
             float scale = Mathf.Max(0.01f, Plugin.Instance.DotScale.Value);
 
             EnsurePool(maxDots);
-            EnsureSmoothing(maxDots);
-
-            if (!_animInitialized)
-            {
-                _frontPool = 0;
-                _animOffset = 0f;
-                _animInitialized = true;
-            }
 
             if (_frontPool < 0 || _frontPool >= maxDots)
                 _frontPool = ((_frontPool % maxDots) + maxDots) % maxDots;
@@ -362,28 +410,25 @@ namespace REPOPathfinder
             {
                 _animOffset -= spacing;
                 _frontPool = (_frontPool - 1 + maxDots) % maxDots;
-                // After the decrement, the pool index sitting at _frontPool is
-                // the sphere whose slot just wrapped from (maxDots-1) to 0. Its
-                // world target jumped from the front of the trail back to the
-                // player end - if we let the smoothing lerp handle that, the
-                // sphere visibly flies across the room ("conveyor belt"). When
-                // activeCount < maxDots this dot was hidden and its _wasVisible
-                // was already false (no-op); when activeCount == maxDots it was
-                // visible and we must clear the flag so the next render snaps.
+                // The dot now at _frontPool just wrapped from the front of the trail to the player
+                // end. Clearing its flag makes it snap there instead of being smoothed across the
+                // whole trail.
                 _wasVisible[_frontPool] = false;
             }
 
             int activeCount = Mathf.Min(maxDots, Mathf.Max(1, Mathf.CeilToInt(availableLength / spacing)));
-            float trailExtent = activeCount * spacing;
-            float endpoint = Mathf.Min(availableLength, trailExtent);
+            float endpoint = Mathf.Min(availableLength, activeCount * spacing);
             float fadeZone = Mathf.Max(0.05f, Mathf.Min(spacing, endpoint * 0.5f) * fadeFrac);
 
             float smoothRate = Plugin.Instance.PositionSmoothRate.Value;
             float lerpT = (smoothRate > 0f) ? 1f - Mathf.Exp(-smoothRate * dt) : 1f;
+            var scaleVector = new Vector3(scale, scale, scale);
 
-            for (int k = 0; k < maxDots; k++)
+            // The pool never shrinks, so after MaxDots is lowered it holds more dots than are in
+            // use: everything from maxDots up is switched off here.
+            for (int k = 0; k < _dots.Count; k++)
             {
-                int slot = ((k - _frontPool) % maxDots + maxDots) % maxDots;
+                int slot = k < maxDots ? ((k - _frontPool) % maxDots + maxDots) % maxDots : int.MaxValue;
                 if (slot >= activeCount)
                 {
                     if (_dots[k].activeSelf) _dots[k].SetActive(false);
@@ -392,21 +437,17 @@ namespace REPOPathfinder
                 }
 
                 float d = slot * spacing + _animOffset;
-                float dClamped = Mathf.Min(d, availableLength);
-
-                Vector3 targetPos = CachedPointAtDistance(playerArc + dClamped);
+                Vector3 targetPos = CachedPointAtDistance(playerArc + Mathf.Min(d, availableLength));
                 targetPos.y += yOffset;
 
-                if (!_wasVisible[k])
-                    _smoothedPositions[k] = targetPos;
-                else
-                    _smoothedPositions[k] = Vector3.Lerp(_smoothedPositions[k], targetPos, lerpT);
-
-                _dots[k].transform.position = _smoothedPositions[k];
+                _smoothedPositions[k] = _wasVisible[k]
+                    ? Vector3.Lerp(_smoothedPositions[k], targetPos, lerpT)
+                    : targetPos;
                 _wasVisible[k] = true;
 
-                if (_dots[k].transform.localScale.x != scale)
-                    _dots[k].transform.localScale = new Vector3(scale, scale, scale);
+                Transform dot = _dots[k].transform;
+                dot.position = _smoothedPositions[k];
+                if (dot.localScale.x != scale) dot.localScale = scaleVector;
 
                 float fadeIn = Mathf.SmoothStep(0f, 1f, d / fadeZone);
                 float fadeOut = Mathf.SmoothStep(0f, 1f, (endpoint - d) / fadeZone);
@@ -414,32 +455,28 @@ namespace REPOPathfinder
 
                 if (!_dots[k].activeSelf) _dots[k].SetActive(true);
             }
-        }
-
-        private void EnsureSmoothing(int count)
-        {
-            if (_smoothedPositions == null || _smoothedPositions.Length < count)
-            {
-                var freshPos = new Vector3[count];
-                var freshVis = new bool[count];
-                if (_smoothedPositions != null)
-                {
-                    System.Array.Copy(_smoothedPositions, freshPos, _smoothedPositions.Length);
-                    System.Array.Copy(_wasVisible, freshVis, _wasVisible.Length);
-                }
-                _smoothedPositions = freshPos;
-                _wasVisible = freshVis;
-            }
+            _anyDotVisible = true;
         }
 
         private void EnsurePool(int count)
         {
-            if (_sharedMaterial == null) _sharedMaterial = CreateSharedMaterial();
+            if (!_materialCreated)
+            {
+                _materialCreated = true;
+                _sharedMaterial = CreateSharedMaterial();
+            }
+
             while (_dots.Count < count)
             {
                 var go = CreateDot(_dots.Count);
                 _dots.Add(go);
                 _renderers.Add(go.GetComponent<MeshRenderer>());
+            }
+
+            if (_smoothedPositions.Length < _dots.Count)
+            {
+                Array.Resize(ref _smoothedPositions, _dots.Count);
+                Array.Resize(ref _wasVisible, _dots.Count);
             }
         }
 
@@ -457,7 +494,7 @@ namespace REPOPathfinder
             renderer.receiveShadows = false;
             renderer.lightProbeUsage = LightProbeUsage.Off;
             renderer.reflectionProbeUsage = ReflectionProbeUsage.Off;
-            renderer.sharedMaterial = _sharedMaterial;
+            if (_sharedMaterial != null) renderer.sharedMaterial = _sharedMaterial;
 
             float scale = Mathf.Max(0.01f, Plugin.Instance.DotScale.Value);
             go.transform.localScale = new Vector3(scale, scale, scale);
@@ -467,17 +504,23 @@ namespace REPOPathfinder
 
         private Material CreateSharedMaterial()
         {
-            var shader = Shader.Find("Sprites/Default")
-                         ?? Shader.Find("Unlit/Color")
-                         ?? Shader.Find("Standard");
-            var mat = new Material(shader);
+            Shader shader = null;
+            foreach (string shaderName in ShaderNames)
+            {
+                shader = Shader.Find(shaderName);
+                if (shader != null) break;
+            }
+            if (shader == null)
+            {
+                Plugin.Log.LogWarning("None of these shaders is in this game build: " + string.Join(", ", ShaderNames) +
+                                      ". The dots use Unity's default material, so they are not see-through.");
+                return null;
+            }
 
-            mat.color = _baseColor;
-            if (mat.HasProperty("_Color")) mat.SetColor("_Color", _baseColor);
-            if (mat.HasProperty("_ZWrite")) mat.SetInt("_ZWrite", 0);
-            if (mat.HasProperty("_SrcBlend")) mat.SetInt("_SrcBlend", (int)BlendMode.SrcAlpha);
-            if (mat.HasProperty("_DstBlend")) mat.SetInt("_DstBlend", (int)BlendMode.OneMinusSrcAlpha);
-            mat.renderQueue = 3500;
+            var mat = new Material(shader) { color = _baseColor, renderQueue = 3500 };
+            if (mat.HasProperty("_ZWrite")) mat.SetFloat("_ZWrite", 0f);
+            if (mat.HasProperty("_SrcBlend")) mat.SetFloat("_SrcBlend", (float)BlendMode.SrcAlpha);
+            if (mat.HasProperty("_DstBlend")) mat.SetFloat("_DstBlend", (float)BlendMode.OneMinusSrcAlpha);
             return mat;
         }
 
@@ -493,10 +536,11 @@ namespace REPOPathfinder
 
         private void HideAllDots()
         {
+            if (!_anyDotVisible) return;
+            _anyDotVisible = false;
             for (int i = 0; i < _dots.Count; i++)
                 if (_dots[i] != null && _dots[i].activeSelf) _dots[i].SetActive(false);
-            if (_wasVisible != null)
-                System.Array.Clear(_wasVisible, 0, _wasVisible.Length);
+            Array.Clear(_wasVisible, 0, _wasVisible.Length);
         }
 
         private static Color ParseColor(string hex)
@@ -508,7 +552,7 @@ namespace REPOPathfinder
         private void ShowToast(string text)
         {
             _toastText = text;
-            _toastUntil = Time.unscaledTime + 1.5f;
+            _toastUntil = Time.unscaledTime + 2f;
         }
 
         private void OnGUI()
@@ -526,13 +570,14 @@ namespace REPOPathfinder
                 _toastStyle.normal.textColor = Color.white;
             }
 
-            float w = 240f, h = 40f;
+            var content = new GUIContent(_toastText);
+            float w = Mathf.Max(240f, _toastStyle.CalcSize(content).x + 32f), h = 40f;
             var rect = new Rect((Screen.width - w) / 2f, Screen.height * 0.18f, w, h);
             var prev = GUI.color;
             GUI.color = new Color(0f, 0f, 0f, 0.6f);
             GUI.Box(rect, GUIContent.none);
             GUI.color = prev;
-            GUI.Label(rect, _toastText, _toastStyle);
+            GUI.Label(rect, content, _toastStyle);
         }
     }
 }
